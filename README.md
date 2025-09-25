@@ -36,3 +36,4 @@ python3 src/train.py configs/midplane_single_timestep_1_box.yaml
 ./main.sh
 ```
 
+
