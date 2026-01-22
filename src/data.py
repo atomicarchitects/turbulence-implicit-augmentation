@@ -14,10 +14,21 @@ np.random.seed(42)
 
 
 class NumpyTimeSeriesDataset(Dataset):
-    def __init__(self, input_file_list, target_file_list, means_stds = None, standardize = True, augmentation_group: Optional[str] = None):
+    def __init__(
+        self,
+        input_file_list,
+        target_file_list,
+        scaling_factors = None,
+        scale: bool = True,
+        augmentation_group: Optional[str] = None,
+        scalar_predictor: bool = False,
+        dtype: torch.dtype = torch.float32,
+    ):
         self.numpy_dir = numpy_dir
         self.inputs = []
         self.targets = []
+        self.scalar_predictor = scalar_predictor
+        self.scale_flag = scale
 
         for input_file, target_file in zip(input_file_list, target_file_list):
             input_numpy = np.load(os.path.join(numpy_dir, input_file)).astype(np.float32)
@@ -25,24 +36,14 @@ class NumpyTimeSeriesDataset(Dataset):
             self.inputs.append(input_numpy)
             self.targets.append(target_numpy)
             
-        self.inputs = torch.from_numpy(np.array(self.inputs)).float()
-        self.targets = torch.from_numpy(np.array(self.targets)).float()
-        
-        if means_stds is not None:
-            self.input_mean = means_stds['input_mean']
-            self.input_std = means_stds['input_std']
-            self.target_mean = means_stds['target_mean']
-            self.target_std = means_stds['target_std']
-
-        else:
-            self.input_mean = self.inputs.mean(dim=(0, 2, 3, 4), keepdim=True)
-            self.input_std = self.inputs.std(dim=(0, 2, 3, 4), keepdim=True)
-            self.target_mean = self.targets.mean(dim=(0, 2, 3, 4), keepdim=True)
-            self.target_std = self.targets.std(dim=(0, 2, 3, 4), keepdim=True)
-            
-        if standardize:
-            self.inputs = (self.inputs - self.input_mean) / (self.input_std + 1e-8)
-            self.targets = (self.targets - self.target_mean) / (self.target_std + 1e-8)
+        self.inputs = torch.from_numpy(np.array(self.inputs)).to(dtype)
+        self.targets = torch.from_numpy(np.array(self.targets)).to(dtype)
+    
+        if scale:
+            if 'sgs' in target_file_list[0]:
+                self.scaling_factors = self.scale_tensor(scaling_factors)
+            else:
+                self.scaling_factors = self.scale_velocity(scaling_factors)
 
         if augmentation_group is not None:
             if augmentation_group == 'so3':
@@ -50,21 +51,59 @@ class NumpyTimeSeriesDataset(Dataset):
             elif augmentation_group == 'oct':
                 self.inputs, self.targets = apply_octahedral_augmentation(self.inputs, self.targets)
 
+    def scale_velocity(self, scaling_factors):
+        if scaling_factors is not None:
+            self.input_mean = scaling_factors['input_mean']
+            self.input_std = scaling_factors['input_std']
+            self.target_mean = scaling_factors['target_mean']
+            self.target_std = scaling_factors['target_std']
 
-    def get_means_stds(self):
+        else:
+            self.input_mean = self.inputs.mean(dim=(0, 2, 3, 4), keepdim=True)
+            self.input_std = self.inputs.std(dim=(0, 2, 3, 4), keepdim=True)
+            self.target_mean = self.targets.mean(dim=(0, 2, 3, 4), keepdim=True)
+            self.target_std = self.targets.std(dim=(0, 2, 3, 4), keepdim=True)
+            
+        self.inputs = (self.inputs - self.input_mean) / (self.input_std + 1e-8)
+        self.targets = (self.targets - self.target_mean) / (self.target_std + 1e-8)
+            
         return {
             'input_mean': self.input_mean,
             'input_std': self.input_std,
             'target_mean': self.target_mean,
-            'target_std': self.target_std
+            'target_std': self.target_std,
         }
+
+    def scale_tensor(self, scaling_factors):
+        if scaling_factors is not None:
+            self.input_mean_magnitude = scaling_factors['input_mean_magnitude']
+            self.target_mean_magnitude = scaling_factors['target_mean_magnitude']
+            
+        else:
+            self.input_mean_magnitude = torch.linalg.norm(self.inputs, dim=1, keepdim=True).mean(dim=(0, 2, 3, 4), keepdim=True)
+            self.target_mean_magnitude = torch.linalg.norm(self.targets, dim=1, keepdim=True).mean(dim=(0, 2, 3, 4), keepdim=True)
+        
+        self.inputs = self.inputs / (self.input_mean_magnitude + 1e-8)
+        self.targets = self.targets / (self.target_mean_magnitude + 1e-8)
+        return {
+            'input_mean_magnitude': self.input_mean_magnitude,
+            'target_mean_magnitude': self.target_mean_magnitude,
+        }
+
+    def get_scaling_factors(self):
+        return self.scaling_factors
 
     def __len__(self):
         return len(self.inputs)
 
     def __getitem__(self, idx):
         input = self.inputs[idx]
-        target = self.targets[idx]
+        #input = torch.linalg.norm(input, dim=0, keepdim=True)
+        if self.scalar_predictor:
+            target = self.targets[idx]
+            target = torch.linalg.norm(target, dim=0, keepdim=True)
+        else:
+            target = self.targets[idx]
         return input, target
 
 def get_tvt_file_lists(dataset_config):
@@ -101,6 +140,8 @@ def get_tvt_file_lists(dataset_config):
     # assert all(os.path.exists(file) for file in test_target_files), f"Test target file {test_target_files[0]} does not exist"
     return train_input_files, train_target_files, val_input_files, val_target_files, test_input_files, test_target_files
 
+
+
 def tvt_split_list(list_to_split, train_split, val_split, test_split):
     n = len(list_to_split)
     train_end = int(n * train_split)
@@ -110,3 +151,10 @@ def tvt_split_list(list_to_split, train_split, val_split, test_split):
     test_list = list_to_split[val_end:]
     
     return train_list, val_list, test_list
+
+def get_test_file_lists(input_prefix, target_prefix):
+    timesteps_avail = get_timesteps_available(numpy_dir, input_prefix)
+    print(f"Number of timesteps available: {len(timesteps_avail)}")
+    test_input_files = [full_filename(input_prefix, box_number, timestep) for box_number in [0,1,2] for timestep in timesteps_avail]
+    test_target_files = [full_filename(target_prefix, box_number, timestep) for box_number in [0,1,2] for timestep in timesteps_avail]
+    return test_input_files, test_target_files

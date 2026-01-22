@@ -1,39 +1,45 @@
 # Implicit Augmentation from Distributional Symmetry in Turbulence Super-Resolution
+# Requirements
+We used `uv`. To set up the environment and install requirements:
+```
+uv sync
+```
+# To get Dataset:
+We have included scripts we used to download data from the Johns Hopkins Turbulence Database. See the `dataset_creation/` folder. It took a few hours to get this data for us.
 
-## Requirements
-To install requirements:
-```
-pip install -r requirements.txt
-```
-## To get the dataset:
-```
-curl -L -o numpy_middle.zip "https://zenodo.org/record/16997999/files/numpy_middle.zip?download=1"
-unzip -o numpy_middle.zip -d dataset 
-curl -L -o numpy_nearwall.zip "https://zenodo.org/record/16997999/files/numpy_nearwall.zip?download=1"
-unzip -o numpy_near_wall.zip -d dataset
-```
-## To train the model..
+# Model weights:
+See the `outputs/` folder for all saved models. The main file is `*checkpoint.pt`, which is saved during training:
 
-For $T=1$ training samples with 1 box at the boundary:
 ```
-python3 src/train.py configs/boundary_single_timestep_1_box.yaml
-```
-For $T=1$ training samples with 1 box at the boundary with explicit rotational augmentation:
-```
-python3 src/train.py configs/boundary_single_timestep_1_box_augmented.yaml
-```
-For $T=1$ training samples with 3 boxes at the boundary:
-```
-python3 src/train.py configs/boundary_single_timestep_3_boxes.yaml
-```
-For $T=1$ training samples with 1 box at the midplane:
-```
-python3 src/train.py configs/midplane_single_timestep_1_box.yaml
+# in `train.py`
+torch.save(
+    {
+        "model": best_state_cpu,
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "val_loss": val_loss,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "seed": config.seed
+    },
+    os.path.join(config['directory'], f'{config.barcode}_checkpoint.pt'),
+)
 ```
 
-## End-to-End examle pipeline:
+There are also loss plots in these folders. `outputs/*/experiment_setup.txt` contains the config file used to run each experiment.
+
+# Running models
+You will need to first download the dataset using our scripts in `dataset_creation`. The main scripts are `src/train.py`, and `src/test_model.py`.
+
+Examples:
 ```
-./main.sh
+uv run src/train.py config_name --device cuda:0
 ```
+
+```
+uv run src/test_model.py model_subdirectory --device cuda:0
+```
+
+I've included the scripts we used to run the experiments on slurm. If you have any questions, feel free to contact rmcconke@mit.edu. 
 
 

@@ -1,133 +1,184 @@
 import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
 import numpy as np
 import tqdm
-from transformations import rand_so3_angles, get_all_octahedral_angles, rotate_3d
+from transformations import unstandardize, rand_so3_angles, get_all_octahedral_angles, rotate_3d, rotate_octahedral_exact, euler_angles_to_matrix
+
+
+def _reshape_rotations(tensor: torch.Tensor, num_rots: int, batch: int) -> torch.Tensor:
+    return tensor.reshape(num_rots, batch, *tensor.shape[1:])
+
+
+def _relative_equivariance_error(diff_norm: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    # [24, B, C, D, H, W]
+    reference_norm = torch.linalg.norm(reference, dim=1, keepdim=True) # [24, B, C, D, H, W]
+    denom = reference_norm.clamp_min(1e-8)
+    return diff_norm / denom
+
+
+def eval_test_set(config, loader, model, criterion, scaling_factors):
+    device = next(model.parameters()).device
+    test_loss = 0.0
+
+    for inputs, targets in tqdm.tqdm(loader, desc="Plain eval test set"):
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+        pred = model(inputs)
+
+        # Get the loss in physical units
+        test_loss += criterion(unstandardize(pred, mean = scaling_factors['target_mean'], std = scaling_factors['target_std']),
+                               unstandardize(targets, mean = scaling_factors['target_mean'], std = scaling_factors['target_std'])).item()
+
+    test_loss = test_loss / len(loader)
+    return test_loss 
+
+def eval_equivariance(config, loader, model, compute_spectra, scaling_factors):
+    device = next(model.parameters()).device
+    abs_equiv_error = 0.0
+    abs_equiv_error_u = 0.0
+    abs_equiv_error_v = 0.0
+    abs_equiv_error_w = 0.0
+    spec_error = []
+    for inputs, targets in tqdm.tqdm(loader, desc="Equivariance eval test set"):
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+        pred = model(inputs)
+        # [len(inputs), 24, C, D, H, W] (angle wise, channelwise, pointwise absolute error)
+        equiv_error = octahedral_equivariance_error(inputs, pred, targets, model, batch_size=config.rotation_batch_size)
+
+        # Convert equivariance error to physical units
+        equiv_error = unstandardize(equiv_error,
+                                    mean = 0, # equiv_error is a difference
+                                    std = scaling_factors['target_std'].unsqueeze(1)) # unsqueeze for correct broadcasting
+        
+        # Get spectra of equiv error
+        if compute_spectra:
+            k, spec_i = compute_isotropic_spectrum(equiv_error.flatten(0,1), Lx=1)
+            spec_error.append(spec_i)
+
+        # Reduce to pointwise norm error [len(inputs), 24, D, H, W]
+        equiv_error_pointwise = torch.linalg.norm(equiv_error, dim=2)
+        equiv_error_u = abs(equiv_error[:,:,0,:,:,:])
+        equiv_error_v = abs(equiv_error[:,:,1,:,:,:])
+        equiv_error_w = abs(equiv_error[:,:,2,:,:,:])
+        abs_equiv_error += torch.mean(equiv_error_pointwise).item()
+        abs_equiv_error_u += torch.mean(equiv_error_u).item()
+        abs_equiv_error_v += torch.mean(equiv_error_v).item()
+        abs_equiv_error_w += torch.mean(equiv_error_w).item()
+
+    abs_equiv_error = abs_equiv_error / len(loader)
+    abs_equiv_error_u = abs_equiv_error_u / len(loader)
+    abs_equiv_error_v = abs_equiv_error_v / len(loader)
+    abs_equiv_error_w = abs_equiv_error_w / len(loader)
+    if compute_spectra:
+        spec_error = np.mean(spec_error, axis=0)
+        return abs_equiv_error, (k, spec_error), abs_equiv_error_u, abs_equiv_error_v, abs_equiv_error_w
+    else:
+        return abs_equiv_error, abs_equiv_error_u, abs_equiv_error_v, abs_equiv_error_w
 
 def octahedral_equivariance_error(inputs, pred, targets, model, batch_size=None):
     """
-    Returns the pointwise equivariance error for a 3D volume under the 24 rotation symmetries of a cube.
+    Compute f(g·x) - g·f(x) for the 24 rotations in the octahedral group.
 
-    Equivariance error is |f(g·x) - g·f(x)|
-    If relative=True, we normalize this quantity by ???? TODO
-
-    Inputs:
-        inputs: [B, C_in, D, H, W]
-        pred:   [B, C_out, D', H', W'] produced by model(inputs)
-        model:  The model to evaluate. Needed because we'll call it on rotated versions of the input.
-        relative: If True, returns the relative equivariance error (see above normalization), otherwise returns the absolute equivariance error.
-        batch_size: If provided, process inputs in batches of this size to save memory
-        Returns:
-        error: [24, B, C, D, H, W]
+    Returns tensors shaped ``[len(inputs), 24, C, D, H, W]`` (angle wise, channelwise, pointwise absolute error).
     """
-    B = inputs.shape[0]
+    num_samples = inputs.shape[0]
+    batch_size = num_samples if batch_size is None else min(num_samples, batch_size)
+    
     all_angles = get_all_octahedral_angles().to(inputs.device)  # [24, 3]
-    
-    if batch_size is None or batch_size >= B:
-        batch_size = B
-    
-    error_list = []
-    rel_error_list = []
-    for start_idx in range(0, B, batch_size):
-        end_idx = min(start_idx + batch_size, B)
+    num_rots = all_angles.shape[0]
 
-        inputs_batch = inputs[start_idx:end_idx] 
-        pred_batch = pred[start_idx:end_idx]      
-        
-        rotated_inputs_batch = rotate_3d(inputs_batch, angles=all_angles) 
-        pred_then_rotated_batch = rotate_3d(pred_batch, angles=all_angles)
-        
-        rotated_then_pred_batch = model(rotated_inputs_batch)  
-        
-        diff = rotated_then_pred_batch - pred_then_rotated_batch
-        error_batch = torch.abs(diff)
-        error_list.append(error_batch)
+    abs_errors = []
+    rel_errors = []
 
-        # relative error
-        den = pred_then_rotated_batch.abs().mean(dim=(-4,-3,-2,-1), keepdim=True).clamp_min(1e-8)  # [R,B,1,1,1,1]
-        rel_error_batch = diff.abs() / den  # [R,B,C,D,H,W]
-        rel_error_list.append(rel_error_batch)
-                
-    # Concatenate along batch dimension: [24, B, C, D, H, W]
-    error = torch.cat(error_list, dim=1)
-    rel_error = torch.cat(rel_error_list, dim=1)
-    return error, rel_error
+    for start in range(0, num_samples, batch_size):
+        end = min(start + batch_size, num_samples)
+        inputs_batch = inputs[start:end]
+        pred_batch = pred[start:end]
+        batch_len = inputs_batch.shape[0]
+
+        rotated_inputs = rotate_octahedral_exact(
+            inputs_batch,
+            all_angles,
+            rotate_channels=True,
+            mode="cartesian",
+        )
+        rotated_preds = rotate_octahedral_exact(
+            pred_batch,
+            all_angles,
+            rotate_channels=True,
+            mode="cartesian",
+        )
+
+        rotated_then_pred = model(rotated_inputs)
+        diff = torch.abs(rotated_then_pred - rotated_preds)
+        abs_errors.append(diff)
+
+    error = torch.stack(abs_errors, dim=0)
+    return error
 
 
 def mean_octahedral_equivariance_error(inputs, pred, targets, model, batch_size=None):
-    absolute_error, relative_error = octahedral_equivariance_error(inputs, pred, targets, model, batch_size=batch_size)
+    absolute_error, relative_error = octahedral_equivariance_error(
+        inputs, pred, targets, model, batch_size=batch_size
+    )
     return torch.mean(absolute_error), torch.mean(relative_error)
 
 
-def so3_equivariance_error(inputs, pred, targets, model, batch_size=None, num_rotations=100, rotation_batch_size=32):
+def so3_equivariance_error(
+    inputs,
+    pred,
+    targets,
+    model,
+    batch_size=None,
+    num_rotations: int = 100,
+    rotation_batch_size: int = 32,
+):
     """
-    Returns the pointwise equivariance error for a 3D volume under random SO(3) rotations.
+    Evaluate |f(g·x) - g·f(x)| for random SO(3) rotations.
 
-    Equivariance error is |f(g·x) - g·f(x)| where g is a random SO(3) rotation.
-    If relative=True, we normalize this quantity by the magnitude of g·f(x).
-
-    Inputs:
-        inputs: [B, C_in, D, H, W]
-        pred:   [B, C_out, D', H', W'] produced by model(inputs)
-        targets: [B, C_out, D', H', W'] ground truth (not used in computation but kept for API consistency)
-        model:  The model to evaluate. Needed because we'll call it on rotated versions of the input.
-        relative: If True, returns the relative equivariance error, otherwise returns the absolute equivariance error.
-        batch_size: If provided, process inputs in batches of this size to save memory
-        num_rotations: Number of random SO(3) rotations to test (default: 100)
-        rotation_batch_size: If provided, process rotations in batches of this size to save memory (default: num_rotations)
-        
-    Returns:
-        error: [num_rotations, B, C, D, H, W]
+    Returns tensors shaped ``[num_rotations, B, C, D, H, W]`` (absolute and relative errors).
     """
-    B = inputs.shape[0]
-    # Generate random SO(3) rotation angles
+    num_samples = inputs.shape[0]
+    batch_size = num_samples if batch_size is None else min(num_samples, batch_size)
+    rotation_batch_size = num_rotations if rotation_batch_size is None else min(num_rotations, rotation_batch_size)
     random_angles = rand_so3_angles(num_rotations).to(inputs.device)  # [num_rotations, 3]
-    
-    if batch_size is None or batch_size >= B:
-        batch_size = B
-    
-    if rotation_batch_size is None or rotation_batch_size >= num_rotations:
-        rotation_batch_size = num_rotations
-    
-    error_list = []
-    rel_error_list = []
-    for start_idx in range(0, B, batch_size):
-        end_idx = min(start_idx + batch_size, B)
 
-        inputs_batch = inputs[start_idx:end_idx]  # [batch_size, C_in, D, H, W]
-        pred_batch = pred[start_idx:end_idx]      # [batch_size, C_out, D', H', W']
-        
-        # Process rotations in batches to save memory
-        rotation_error_list = []
-        rotation_rel_error_list = []
-        for rot_start_idx in range(0, num_rotations, rotation_batch_size):
-            rot_end_idx = min(rot_start_idx + rotation_batch_size, num_rotations)
-            
-            # Get batch of rotation angles
-            angles_batch = random_angles[rot_start_idx:rot_end_idx]  # [rotation_batch_size, 3]
-            
-            rotated_inputs_batch = rotate_3d(inputs_batch, angles=angles_batch)  # [rotation_batch_size, batch_size, C_in, D, H, W]
-            pred_then_rotated_batch = rotate_3d(pred_batch, angles=angles_batch)  # [rotation_batch_size, batch_size, C_out, D', H', W']
-            
-            rotated_then_pred_batch = model(rotated_inputs_batch)  
-            
-            diff = rotated_then_pred_batch - pred_then_rotated_batch
-            error_batch = torch.abs(diff)
-            rotation_error_list.append(error_batch)
+    abs_errors = []
+    rel_errors = []
 
-            # relative error
-            den = pred_then_rotated_batch.abs().mean(dim=(-4,-3,-2,-1), keepdim=True).clamp_min(1e-8)  # [R,B,1,1,1,1]
-            rel_error_batch = diff.abs() / den  # [R,B,C,D,H,W]
-            rotation_rel_error_list.append(rel_error_batch)
+    for start in range(0, num_samples, batch_size):
+        end = min(start + batch_size, num_samples)
+        inputs_batch = inputs[start:end]
+        pred_batch = pred[start:end]
+        batch_len = inputs_batch.shape[0]
 
-        rotation_error_list = torch.cat(rotation_error_list, dim=0)
-        rotation_rel_error_list = torch.cat(rotation_rel_error_list, dim=0)
-        error_list.append(rotation_error_list)
-        rel_error_list.append(rotation_rel_error_list)
-    
-    # Concatenate along batch dimension: [num_rotations, B, C, D, H, W]
-    error = torch.cat(error_list, dim=1)
-    rel_error = torch.cat(rel_error_list, dim=1)
+        batch_abs_errors = []
+        batch_rel_errors = []
+
+        for rot_start in range(0, num_rotations, rotation_batch_size):
+            rot_end = min(rot_start + rotation_batch_size, num_rotations)
+            angles_chunk = random_angles[rot_start:rot_end]
+            chunk_rots = angles_chunk.shape[0]
+
+            rotated_inputs = rotate_3d(inputs_batch, angles=angles_chunk)  # [chunk_rots * batch, ...]
+            rotated_preds = rotate_3d(pred_batch, angles=angles_chunk)
+
+            rotated_then_pred = model(rotated_inputs)
+
+            rotated_then_pred = _reshape_rotations(rotated_then_pred, chunk_rots, batch_len)
+            rotated_preds = _reshape_rotations(rotated_preds, chunk_rots, batch_len)
+
+            diff = rotated_then_pred - rotated_preds
+            batch_abs_errors.append(diff.abs())
+            batch_rel_errors.append(_relative_equivariance_error(diff, rotated_preds))
+
+        abs_errors.append(torch.cat(batch_abs_errors, dim=0))
+        rel_errors.append(torch.cat(batch_rel_errors, dim=0))
+
+    error = torch.cat(abs_errors, dim=1)
+    rel_error = torch.cat(rel_errors, dim=1)
     return error, rel_error
 
 
@@ -148,133 +199,16 @@ def mean_so3_equivariance_error(inputs, pred, targets, model, batch_size=None, n
     Returns:
         Scalar tensor with mean equivariance error
     """
-    absolute_error, relative_error = so3_equivariance_error(inputs, pred, targets, model, batch_size=batch_size, num_rotations=num_rotations, rotation_batch_size=rotation_batch_size)
+    absolute_error, relative_error = so3_equivariance_error(
+        inputs,
+        pred,
+        targets,
+        model,
+        batch_size=batch_size,
+        num_rotations=num_rotations,
+        rotation_batch_size=rotation_batch_size
+    )
     return torch.mean(absolute_error), torch.mean(relative_error)
-
-
-### DEPRECATED
-
-# def c4_equivariance_error(inputs, pred, model, relative=False): 
-#     c4_equiv_err = 0
-#     for theta in range(4):
-#         pred_then_rotated = torch.rot90(pred,k=theta,dims = (2,3))
-#         rotated_then_pred = model(torch.rot90(inputs,k=theta,dims = (2,3)))
-#         if relative:
-#             eps = 1e-8
-#             num_sq = (rotated_then_pred - pred_then_rotated).flatten(start_dim=1).pow(2).sum(dim=1)     
-#             den_sq = pred_then_rotated.flatten(start_dim=1).pow(2).sum(dim=1) + eps
-#             c4_equiv_err += (num_sq / den_sq).mean().item()   # scalar for this batch
-#         else:
-#             c4_equiv_err += torch.mean(torch.abs(rotated_then_pred - pred_then_rotated)).item()
-#     return c4_equiv_err / 4
-
-
-# def s4_equivariance_error(inputs, pred, model, relative=False):
-#     """
-#     Equivariance error for 3D volumes under the 24 rotation symmetries of a cube.
-
-#     inputs: [B, C_in, D, H, W]
-#     pred:   [B, C_out, D', H', W'] produced by model(inputs)
-
-#     For each of the 24 rotations g in the cube rotation group:
-#       - Compare f(g·x) versus g·f(x)
-
-#     Returns the mean error over the 24 rotations. If relative=True, uses a
-#     relative squared error per sample: ||f(g·x) - g·f(x)||^2 / (||g·f(x)||^2 + eps),
-#     averaged over the batch, then averaged over the 24 rotations, then sqrt.
-#     Otherwise returns mean absolute error averaged over the 24 rotations.
-#     """
-#     # Helper rotations around principal axes for 5D tensors [B,C,D,H,W]
-#     def rot_x(t, k):
-#         # rotate around X (width) axis -> rotate (D,H) plane
-#         return torch.rot90(t, k=k, dims=(2, 3))
-
-#     def rot_y(t, k):
-#         # rotate around Y (height) axis -> rotate (D,W) plane
-#         return torch.rot90(t, k=k, dims=(2, 4))
-
-#     def rot_z(t, k):
-#         # rotate around Z (depth) axis -> rotate (H,W) plane
-#         return torch.rot90(t, k=k, dims=(3, 4))
-
-#     # Channel rotation for vector fields (C == 3) under 90-degree steps
-#     def ch_rot_x(t, k):
-#         if t.shape[1] != 3:
-#             return t
-#         k = k % 4
-#         if k == 0:
-#             return t
-#         vx, vy, vz = t[:, 0:1], t[:, 1:2], t[:, 2:3]
-#         if k == 1:   # rotation in (z,y) plane: (z,y)->(-y,z) => (x, y, z) -> (x, z, -y)
-#             return torch.cat([vx, vz, -vy], dim=1)
-#         if k == 2:   # y' = -y, z' = -z, x' = x
-#             return torch.cat([vx, -vy, -vz], dim=1)
-#         # k == 3: inverse of k==1: (x, y, z) -> (x, -z, y)
-#         return torch.cat([vx, -vz, vy], dim=1)
-
-#     def ch_rot_y(t, k):
-#         if t.shape[1] != 3:
-#             return t
-#         k = k % 4
-#         if k == 0:
-#             return t
-#         vx, vy, vz = t[:, 0:1], t[:, 1:2], t[:, 2:3]
-#         if k == 1:   # x' = z, z' = -x, y' = y
-#             return torch.cat([vz, vy, -vx], dim=1)
-#         if k == 2:   # x' = -x, z' = -z, y' = y
-#             return torch.cat([-vx, vy, -vz], dim=1)
-#         # k == 3:    # x' = -z, z' = x, y' = y
-#         return torch.cat([-vz, vy, vx], dim=1)
-
-#     def ch_rot_z(t, k):
-#         if t.shape[1] != 3:
-#             return t
-#         k = k % 4
-#         if k == 0:
-#             return t
-#         vx, vy, vz = t[:, 0:1], t[:, 1:2], t[:, 2:3]
-#         if k == 1:   # x' = -y, y' = x, z' = z
-#             return torch.cat([-vy, vx, vz], dim=1)
-#         if k == 2:   # x' = -x, y' = -y, z' = z
-#             return torch.cat([-vx, -vy, vz], dim=1)
-#         # k == 3:    # x' = y, y' = -x, z' = z
-#         return torch.cat([vy, -vx, vz], dim=1)
-
-#     # 6 base orientations for the "up" axis: z, y, -z, -y, x, -x
-#     base_transforms = [
-#         (lambda t: t,              lambda t: t),             # z up
-#         (lambda t: rot_x(t, 1),    lambda t: ch_rot_x(t, 1)),# y up
-#         (lambda t: rot_x(t, 2),    lambda t: ch_rot_x(t, 2)),# -z up
-#         (lambda t: rot_x(t, 3),    lambda t: ch_rot_x(t, 3)),# -y up
-#         (lambda t: rot_y(t, 1),    lambda t: ch_rot_y(t, 1)),# x up
-#         (lambda t: rot_y(t, 3),    lambda t: ch_rot_y(t, 3)),# -x up
-#     ]
-
-#     total_err = 0.0
-#     num_rots = 0
-
-#     for base_spatial, base_channel in base_transforms:
-#         inputs_b = base_spatial(inputs)
-#         inputs_b = base_channel(inputs_b)
-#         pred_b = base_spatial(pred)
-#         pred_b = base_channel(pred_b)
-#         for k in range(4):
-#             pred_then_rotated = rot_z(pred_b, k)
-#             pred_then_rotated = ch_rot_z(pred_then_rotated, k)
-
-#             rotated_input = rot_z(inputs_b, k)
-#             rotated_input = ch_rot_z(rotated_input, k)
-#             rotated_then_pred = model(rotated_input)
-#             if relative:
-#                 eps = 1e-8
-#                 num_sq = (rotated_then_pred - pred_then_rotated).flatten(start_dim=1).pow(2).sum(dim=1)
-#                 den_sq = pred_then_rotated.flatten(start_dim=1).pow(2).sum(dim=1) + eps
-#                 total_err += (num_sq / den_sq).mean().item()
-#             else:
-#                 total_err += torch.mean(torch.abs(rotated_then_pred - pred_then_rotated)).item()
-#             num_rots += 1
-
-#     return total_err / num_rots  # divide by 24
 
 
 def visualize_predictions(model, val_loader, output_path):
@@ -298,11 +232,14 @@ def visualize_predictions(model, val_loader, output_path):
             inp = inputs[i].cpu().numpy()
             tgt = targets[i].cpu().numpy()
             pred = predictions[i].cpu().numpy()
-            pred_then_rotated = torch.rot90(predictions[i],k=1,dims=(1,2))[0].cpu().numpy()
-            rotated_then_predicted = model(torch.rot90(inputs[i].unsqueeze(0),k=1,dims=(2,3)))[0][0].cpu().numpy()
+            #pred_then_rotated = torch.rot90(predictions[i],k=1,dims=(1,2))[0].cpu().numpy()
+            pred_then_rotated_oct = rotate_octahedral_exact(predictions[i], 1, rotate_channels=True, mode="cartesian")
+            rotated_inputs = rotate_octahedral_exact(inputs[i], 1, rotate_channels=True, mode="cartesian")
+            #rotated_then_predicted = model(torch.rot90(inputs[i].unsqueeze(0),k=1,dims=(2,3)))[0][0].cpu().numpy()
+            rotated_then_predicted = model(rotated_inputs)[0].cpu().numpy()
             
             # Compute difference for diverging colormap
-            diff = rotated_then_predicted - pred_then_rotated
+            diff = rotated_then_predicted - pred_then_rotated_oct
             
             if inp.ndim == 3:  # Remove channel dim if needed
                 inp = inp.squeeze() if inp.shape[0] == 1 else inp.transpose(1,2,0)
@@ -342,6 +279,78 @@ def visualize_predictions(model, val_loader, output_path):
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
 
+def visualize_equivariance(inputs, pred, targets, model, angle=torch.tensor([0,0,np.pi/2])):
+    #angle = get_all_octahedral_angles()[0]
+    _, Cin, Din, Hin, Win = inputs.shape
+    rotated_input = rotate_octahedral_exact(inputs, angle, rotate_channels=True, mode="cartesian")
+    rotated_pred = rotate_octahedral_exact(model(inputs), angle, rotate_channels=True, mode="cartesian")
+    rotated_then_pred = model(rotated_input)
+    indices = [(0,0,0), (5,6,7), (11,5,12)]
+
+    print(f'Example pairs')
+    for spatial_index in indices:
+        print(f'Predicted then rotated: {rotated_then_pred[...,*spatial_index].detach().cpu().numpy()}')
+        print(f'Rotated then predicted: {rotated_pred[...,*spatial_index].detach().cpu().numpy()}')
+        print(f'Difference: {rotated_then_pred[...,*spatial_index].detach().cpu().numpy() - rotated_pred[...,*spatial_index].detach().cpu().numpy()}')   
+
+
+
+def plot_equivariance(model, loader, output_path, title, angle=torch.tensor([0,0,np.pi/2])):
+    model.eval()
+    with torch.no_grad():
+        # ----- fetch -----
+        inputs, targets = next(iter(loader))
+        inputs = inputs.to(next(model.parameters()).device)
+        targets = targets.to(next(model.parameters()).device)
+        pred = model(inputs)
+        #angle = get_all_octahedral_angles()[0]
+        _, Cin, Din, Hin, Win = inputs.shape
+        _, Cout, _, _, _ = pred.shape
+
+        rotated_input = rotate_octahedral_exact(inputs, angle, rotate_channels=True, mode="cartesian")
+        rotated_pred = rotate_octahedral_exact(pred, angle, rotate_channels=True, mode="cartesian")
+        rotated_then_pred = model(rotated_input)
+
+        idx=0
+        slice_idx= 7
+        fig, axes = plt.subplots(6,Cin,figsize=(30,30))
+
+        for i in range(Cin):
+            im=axes[0,i].imshow(inputs[idx][i][:,:,slice_idx].detach().cpu().numpy(), cmap='RdBu_r',origin='lower')
+            axes[0,i].set_title(f'Input {i}')
+            axes[0,i].axis('off')
+            plt.colorbar(im, ax=axes[0, i], fraction=0.046)
+        for i in range(Cin):
+            axes[1,i].imshow(rotated_input[idx][i][:,:,slice_idx].detach().cpu().numpy(), cmap='RdBu_r',origin='lower')
+            axes[1,i].set_title(f'Rotated Input {i}')
+            axes[1,i].axis('off')
+            plt.colorbar(im, ax=axes[1, i], fraction=0.046)
+        for i in range(Cout):
+            axes[2,i].imshow(pred[idx][i][:,:,slice_idx].detach().cpu().numpy(), cmap='RdBu_r',origin='lower')
+            axes[2,i].set_title(f'Prediction {i}')
+            axes[2,i].axis('off')
+        for i in range(Cout):
+            im=axes[3,i].imshow(rotated_pred[idx][i][:,:,slice_idx].detach().cpu().numpy(), cmap='RdBu_r',origin='lower')
+            axes[3,i].set_title(f'Rotated Pred {i}')
+            axes[3,i].axis('off')
+            plt.colorbar(im, ax=axes[3, i], fraction=0.046)
+        for i in range(Cout):
+            im=axes[4,i].imshow(rotated_then_pred[idx][i][:,:,slice_idx].detach().cpu().numpy(), cmap='RdBu_r',origin='lower')
+            axes[4,i].set_title(f'Rotated Then Pred {i}')
+            axes[4,i].axis('off')
+            plt.colorbar(im, ax=axes[4, i], fraction=0.046)
+        for i in range(Cout):
+            im=axes[5,i].imshow(rotated_pred[idx][i][:,:,slice_idx].detach().cpu().numpy() - rotated_then_pred[idx][i][:,:,slice_idx].detach().cpu().numpy(), cmap='RdBu_r',origin='lower')
+            axes[5,i].set_title(f'Difference {i}')
+            axes[5,i].axis('off')
+            plt.colorbar(im, ax=axes[5, i], fraction=0.046)
+        
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+
+
 def visualize_predictions_3D(model, loader, output_path, title, center_mode: str = "cell"):
     """
     center_mode:
@@ -350,7 +359,6 @@ def visualize_predictions_3D(model, loader, output_path, title, center_mode: str
     """
     def grid_coords(n: int, mode: str):
         if mode == "cell":
-            # cell centers in [0,1)
             return (np.arange(n) + 0.5) / n
         elif mode == "node":
             if n == 1:
@@ -360,108 +368,250 @@ def visualize_predictions_3D(model, loader, output_path, title, center_mode: str
             raise ValueError("center_mode must be 'cell' or 'node'")
 
     def center_index(n: int, mode: str):
-        # physical midpoint x*=0.5; choose the nearest index
         coords = grid_coords(n, mode)
         return int(np.argmin(np.abs(coords - 0.5)))
 
     def map_index_from_src_to_dst(i_src: int, n_src: int, n_dst: int, mode: str):
-        # take src index's physical coordinate, pick nearest plane in dst
         x_src = grid_coords(n_src, mode)[i_src]
         coords_dst = grid_coords(n_dst, mode)
         return int(np.argmin(np.abs(coords_dst - x_src)))
+    
+    def get_component_labels(C):
+        """Get component labels based on number of channels"""
+        if C == 1:
+            return ['Scalar']
+        elif C == 3:
+            return ['u', 'v', 'w']
+        elif C == 6:
+            return ['xx', 'yy', 'zz', 'xy', 'xz', 'yz']
+        elif C == 9:
+            return ['xx', 'xy', 'xz', 'yx', 'yy', 'yz', 'zx', 'zy', 'zz']
+        else:
+            return [f'C{i}' for i in range(C)]
+    
+    def compute_magnitude(data):
+        """Compute magnitude based on number of channels"""
+        C = data.shape[0]
+        if C == 1:
+            return np.abs(data[0])
+        elif C == 3:
+            return np.sqrt(np.sum(data**2, axis=0))
+        elif C == 6:
+            return np.sqrt(data[0]**2 + data[1]**2 + data[2]**2 + 
+                          2*data[3]**2 + 2*data[4]**2 + 2*data[5]**2)
+        elif C == 9:
+            return np.sqrt(np.sum(data**2, axis=0))
+        else:
+            return np.sqrt(np.sum(data**2, axis=0))
 
     model.eval()
     with torch.no_grad():
         # ----- fetch -----
         inputs, targets = next(iter(loader))
-        input_sample  = inputs[0:1].to(next(model.parameters()).device)   # (1, Cin, Din, Hin, Win)
-        target_sample = targets[0].to(next(model.parameters()).device)    # (Ct, Dt, Ht, Wt)
-        prediction    = model(input_sample)[0]                 # (Cp, Dp, Hp, Wp)
+        input_sample  = inputs[0:1].to(next(model.parameters()).device)
+        target_sample = targets[0].to(next(model.parameters()).device)
+        prediction    = model(input_sample)[0]
 
         # ----- to numpy -----
-        inp  = input_sample[0].detach().cpu().numpy()          # (Cin, Din, Hin, Win)
-        tgt  = target_sample.detach().cpu().numpy()            # (Ct,  Dt,  Ht,  Wt)
-        pred = prediction.detach().cpu().numpy()               # (Cp,  Dp,  Hp,  Wp)
+        inp  = input_sample[0].detach().cpu().numpy()
+        tgt  = target_sample.detach().cpu().numpy()
+        pred = prediction.detach().cpu().numpy()
 
-        # sanity
-        assert pred.shape[0] == 3 and tgt.shape[0] == 3, "Expected 3 channels (u,v,w) for pred and target."
-        # input may be 3 (u,v,w) or something else; we’ll still compute magnitude across channels.
         Cin, Din, Hin, Win = inp.shape
         Ct,  Dt,  Ht,  Wt  = tgt.shape
         Cp,  Dp,  Hp,  Wp  = pred.shape
 
-        # ----- pick the same physical slice location(s) based on the INPUT'S center -----
+        # ----- pick slice locations -----
         cin_d, cin_h, cin_w = center_index(Din, center_mode), center_index(Hin, center_mode), center_index(Win, center_mode)
-        # map that same physical location to target/pred grids
         ctg_d = map_index_from_src_to_dst(cin_d, Din, Dt, center_mode)
         ctg_h = map_index_from_src_to_dst(cin_h, Hin, Ht, center_mode)
         ctg_w = map_index_from_src_to_dst(cin_w, Win, Wt, center_mode)
-
         cpr_d = map_index_from_src_to_dst(cin_d, Din, Dp, center_mode)
         cpr_h = map_index_from_src_to_dst(cin_h, Hin, Hp, center_mode)
-        cpr_w = map_index_from_src_to_dst(cin_w, Win, Wp, center_mode)
+        cpr_w = map_index_from_src_to_dst(cin_w, Din, Wp, center_mode)
 
-        # ----- magnitudes (aligned in physical space) -----
-        # Inputs
-        xy_mag_inp = np.sqrt(np.sum(inp[:, cin_d, :, :]**2, axis=0))   # (Hin, Win)
-        xz_mag_inp = np.sqrt(np.sum(inp[:, :, cin_h, :]**2, axis=0))   # (Din, Win)
-        yz_mag_inp = np.sqrt(np.sum(inp[:, :, :, cin_w]**2, axis=0))   # (Din, Hin)
+        # ----- extract XY slices for all components -----
+        inp_xy_slices = inp[:, cin_d, :, :]      # (Cin, Hin, Win)
+        tgt_xy_slices = tgt[:, ctg_d, :, :]      # (Ct, Ht, Wt)
+        pred_xy_slices = pred[:, cpr_d, :, :]    # (Cp, Hp, Wp)
 
-        # Targets (mapped indices)
-        xy_mag_tgt = np.sqrt(np.sum(tgt[:, ctg_d, :, :]**2, axis=0))   # (Ht, Wt)
-        xz_mag_tgt = np.sqrt(np.sum(tgt[:, :, ctg_h, :]**2, axis=0))   # (Dt, Wt)
-        yz_mag_tgt = np.sqrt(np.sum(tgt[:, :, :, ctg_w]**2, axis=0))   # (Dt, Ht)
+        # Get component labels
+        labels_inp = get_component_labels(Cin)
+        labels_tgt = get_component_labels(Ct)
+        labels_pred = get_component_labels(Cp)
 
-        # Predictions (mapped indices)
-        xy_mag_pred = np.sqrt(np.sum(pred[:, cpr_d, :, :]**2, axis=0)) # (Hp, Wp)
-        xz_mag_pred = np.sqrt(np.sum(pred[:, :, cpr_h, :]**2, axis=0)) # (Dp, Wp)
-        yz_mag_pred = np.sqrt(np.sum(pred[:, :, :, cpr_w]**2, axis=0)) # (Dp, Hp)
+        # Compute magnitudes
+        inp_mag = compute_magnitude(inp_xy_slices)
+        tgt_mag = compute_magnitude(tgt_xy_slices)
+        pred_mag = compute_magnitude(pred_xy_slices)
 
-        # ----- rotation analysis (prediction index space only) -----
-        pred_then_rot = torch.rot90(prediction, k=1, dims=(2, 3))        # rotate (H,W)
+        # ----- rotation analysis -----
+        angle = torch.tensor([np.pi/2,-np.pi/2,np.pi/2])
+        pred_then_rot = rotate_octahedral_exact(prediction, angle, rotate_channels=False, mode="cartesian")
         pred_then_rot_xy = pred_then_rot[:, cpr_d, :, :].cpu().numpy()
-        pred_then_rot_mag = np.sqrt(np.sum(pred_then_rot_xy**2, axis=0))
+        pred_then_rot_mag = compute_magnitude(pred_then_rot_xy)
 
-        rotated_input = torch.rot90(input_sample, k=1, dims=(3, 4))      # rotate (H,W) in input
-        rot_then_pred = model(rotated_input)[0].detach().cpu().numpy()   # predict → pred grid
+        rotated_input = rotate_octahedral_exact(input_sample, angle, rotate_channels=True, mode="cartesian")
+        rot_then_pred = model(rotated_input)[0].detach().cpu().numpy()
         rot_then_pred_xy = rot_then_pred[:, cpr_d, :, :]
-        rot_then_pred_mag = np.sqrt(np.sum(rot_then_pred_xy**2, axis=0))
+        rot_then_pred_mag = compute_magnitude(rot_then_pred_xy)
+        
+        # Component-wise differences
+        diff_components = rot_then_pred_xy - pred_then_rot_xy
+        diff_mag = rot_then_pred_mag - pred_then_rot_mag
 
-        diff = rot_then_pred_mag - pred_then_rot_mag
+        # ----- determine grid layout -----
+        # Row 0: Input components + magnitude
+        # Row 1: Target components + magnitude  
+        # Row 2: Pred components + magnitude
+        # Row 3: Pred → Rot components + magnitude
+        # Row 4: Rot → Pred components + magnitude
+        # Row 5: Difference components + magnitude
+        n_cols = max(Cin, Ct, Cp) + 1  # +1 for magnitude
+        
+        fig, axes = plt.subplots(6, n_cols, figsize=(4*n_cols, 24))
+        if n_cols == 1:
+            axes = axes.reshape(-1, 1)
 
-        # ----- figure (4x3) -----
-        fig, axes = plt.subplots(4, 3, figsize=(12, 16))
+        # ----- compute vmin/vmax for each component -----
+        # For input row - only input
+        component_ranges_input = {}
+        for c in range(Cin):
+            vmax = np.abs(inp_xy_slices[c]).max()
+            component_ranges_input[c] = (-vmax, vmax) if inp_xy_slices[c].min() < 0 else (0, vmax)
+        
+        # For target and prediction rows - combine target AND all prediction variants
+        component_ranges_target_pred = {}
+        for c in range(max(Ct, Cp)):
+            vals = []
+            if c < Ct:
+                vals.append(np.abs(tgt_xy_slices[c]).max())
+            if c < Cp:
+                vals.extend([
+                    np.abs(pred_xy_slices[c]).max(),
+                    np.abs(pred_then_rot_xy[c]).max(),
+                    np.abs(rot_then_pred_xy[c]).max()
+                ])
+            
+            if vals:
+                vmax = max(vals)
+                # Check if any values are negative to determine if we need symmetric range
+                has_negative = False
+                if c < Ct and tgt_xy_slices[c].min() < 0:
+                    has_negative = True
+                if c < Cp:
+                    if pred_xy_slices[c].min() < 0 or pred_then_rot_xy[c].min() < 0 or rot_then_pred_xy[c].min() < 0:
+                        has_negative = True
+                
+                component_ranges_target_pred[c] = (-vmax, vmax) if has_negative else (0, vmax)
+        
+        # For difference row
+        diff_ranges = {}
+        for c in range(Cp):
+            vmax = np.abs(diff_components[c]).max()
+            diff_ranges[c] = (-vmax, vmax)
+        
+        # Magnitude ranges
+        mag_max = max(inp_mag.max(), tgt_mag.max(), pred_mag.max(), 
+                     pred_then_rot_mag.max(), rot_then_pred_mag.max())
+        diff_mag_vmax = max(np.abs(diff_mag).max(), 0.01)
 
-        vmin = 0.0
-        vmax = max(
-            xy_mag_inp.max(), xz_mag_inp.max(), yz_mag_inp.max(),
-            xy_mag_tgt.max(), xz_mag_tgt.max(), yz_mag_tgt.max(),
-            xy_mag_pred.max(), xz_mag_pred.max(), yz_mag_pred.max(),
-            pred_then_rot_mag.max(), rot_then_pred_mag.max()
-        )
-        diff_vmax = max(np.abs(diff).max(), 0.1)
+        # ----- Row 0: Input components -----
+        for c in range(Cin):
+            vmin, vmax = component_ranges_input.get(c, (0, 1))
+            im = axes[0, c].imshow(inp_xy_slices[c], cmap='RdBu_r', vmin=vmin, vmax=vmax)
+            axes[0, c].set_title(f'Input {labels_inp[c]}')
+            axes[0, c].axis('off')
+            plt.colorbar(im, ax=axes[0, c], fraction=0.046)
+        # Input magnitude
+        im_inp_mag = axes[0, Cin].imshow(inp_mag, cmap='viridis', vmin=0, vmax=mag_max)
+        axes[0, Cin].set_title('Input |·|')
+        axes[0, Cin].axis('off')
+        plt.colorbar(im_inp_mag, ax=axes[0, Cin], fraction=0.046)
+        # Hide unused
+        for c in range(Cin + 1, n_cols):
+            axes[0, c].axis('off')
 
-        # Row 0: Inputs
-        axes[0,0].imshow(xy_mag_inp, cmap='viridis', vmin=vmin, vmax=vmax); axes[0,0].set_title('XY Input'); axes[0,0].axis('off')
-        axes[0,1].imshow(xz_mag_inp, cmap='plasma', vmin=vmin, vmax=vmax);  axes[0,1].set_title('XZ Input'); axes[0,1].axis('off')
-        axes[0,2].imshow(yz_mag_inp, cmap='cividis', vmin=vmin, vmax=vmax); axes[0,2].set_title('YZ Input'); axes[0,2].axis('off')
+        # ----- Row 1: Target components -----
+        for c in range(Ct):
+            vmin, vmax = component_ranges_target_pred.get(c, (0, 1))
+            im = axes[1, c].imshow(tgt_xy_slices[c], cmap='RdBu_r', vmin=vmin, vmax=vmax)
+            axes[1, c].set_title(f'Target {labels_tgt[c]}')
+            axes[1, c].axis('off')
+            plt.colorbar(im, ax=axes[1, c], fraction=0.046)
+        # Target magnitude
+        im_tgt_mag = axes[1, Ct].imshow(tgt_mag, cmap='viridis', vmin=0, vmax=mag_max)
+        axes[1, Ct].set_title('Target |·|')
+        axes[1, Ct].axis('off')
+        plt.colorbar(im_tgt_mag, ax=axes[1, Ct], fraction=0.046)
+        # Hide unused
+        for c in range(Ct + 1, n_cols):
+            axes[1, c].axis('off')
 
-        # Row 1: Targets (physically aligned to input center)
-        axes[1,0].imshow(xy_mag_tgt, cmap='viridis', vmin=vmin, vmax=vmax); axes[1,0].set_title(f'XY True (d={ctg_d})'); axes[1,0].axis('off')
-        axes[1,1].imshow(xz_mag_tgt, cmap='plasma', vmin=vmin, vmax=vmax);  axes[1,1].set_title(f'XZ True (h={ctg_h})'); axes[1,1].axis('off')
-        axes[1,2].imshow(yz_mag_tgt, cmap='cividis', vmin=vmin, vmax=vmax); axes[1,2].set_title(f'YZ True (w={ctg_w})'); axes[1,2].axis('off')
+        # ----- Row 2: Prediction components -----
+        for c in range(Cp):
+            vmin, vmax = component_ranges_target_pred.get(c, (0, 1))
+            im = axes[2, c].imshow(pred_xy_slices[c], cmap='RdBu_r', vmin=vmin, vmax=vmax)
+            axes[2, c].set_title(f'Pred {labels_pred[c]}')
+            axes[2, c].axis('off')
+            plt.colorbar(im, ax=axes[2, c], fraction=0.046)
+        # Prediction magnitude
+        im_pred_mag = axes[2, Cp].imshow(pred_mag, cmap='viridis', vmin=0, vmax=mag_max)
+        axes[2, Cp].set_title('Pred |·|')
+        axes[2, Cp].axis('off')
+        plt.colorbar(im_pred_mag, ax=axes[2, Cp], fraction=0.046)
+        # Hide unused
+        for c in range(Cp + 1, n_cols):
+            axes[2, c].axis('off')
 
-        # Row 2: Predictions (physically aligned to input center)
-        axes[2,0].imshow(xy_mag_pred, cmap='viridis', vmin=vmin, vmax=vmax); axes[2,0].set_title(f'XY Pred (d={cpr_d})'); axes[2,0].axis('off')
-        axes[2,1].imshow(xz_mag_pred, cmap='plasma', vmin=vmin, vmax=vmax);  axes[2,1].set_title(f'XZ Pred (h={cpr_h})'); axes[2,1].axis('off')
-        axes[2,2].imshow(yz_mag_pred, cmap='cividis', vmin=vmin, vmax=vmax); axes[2,2].set_title(f'YZ Pred (w={cpr_w})'); axes[2,2].axis('off')
+        # ----- Row 3: Pred → Rot components -----
+        for c in range(Cp):
+            vmin, vmax = component_ranges_target_pred.get(c, (0, 1))
+            im = axes[3, c].imshow(pred_then_rot_xy[c], cmap='RdBu_r', vmin=vmin, vmax=vmax)
+            axes[3, c].set_title(f'Pred→Rot {labels_pred[c]}')
+            axes[3, c].axis('off')
+            plt.colorbar(im, ax=axes[3, c], fraction=0.046)
+        # Magnitude
+        im_rot1_mag = axes[3, Cp].imshow(pred_then_rot_mag, cmap='viridis', vmin=0, vmax=mag_max)
+        axes[3, Cp].set_title('Pred→Rot |·|')
+        axes[3, Cp].axis('off')
+        plt.colorbar(im_rot1_mag, ax=axes[3, Cp], fraction=0.046)
+        # Hide unused
+        for c in range(Cp + 1, n_cols):
+            axes[3, c].axis('off')
 
-        # Row 3: Rotation analysis (prediction space)
-        axes[3,0].imshow(pred_then_rot_mag, cmap='YlGnBu', vmin=vmin, vmax=vmax); axes[3,0].set_title('Pred → Rot 90°'); axes[3,0].axis('off')
-        axes[3,1].imshow(rot_then_pred_mag, cmap='YlGnBu', vmin=vmin, vmax=vmax); axes[3,1].set_title('Rot 90° → Pred'); axes[3,1].axis('off')
-        im_diff = axes[3,2].imshow(diff, cmap='RdBu_r', vmin=-diff_vmax, vmax=diff_vmax); axes[3,2].set_title('Difference'); axes[3,2].axis('off')
+        # ----- Row 4: Rot → Pred components -----
+        for c in range(Cp):
+            vmin, vmax = component_ranges_target_pred.get(c, (0, 1))
+            im = axes[4, c].imshow(rot_then_pred_xy[c], cmap='RdBu_r', vmin=vmin, vmax=vmax)
+            axes[4, c].set_title(f'Rot→Pred {labels_pred[c]}')
+            axes[4, c].axis('off')
+            plt.colorbar(im, ax=axes[4, c], fraction=0.046)
+        # Magnitude
+        im_rot2_mag = axes[4, Cp].imshow(rot_then_pred_mag, cmap='viridis', vmin=0, vmax=mag_max)
+        axes[4, Cp].set_title('Rot→Pred |·|')
+        axes[4, Cp].axis('off')
+        plt.colorbar(im_rot2_mag, ax=axes[4, Cp], fraction=0.046)
+        # Hide unused
+        for c in range(Cp + 1, n_cols):
+            axes[4, c].axis('off')
 
-        cbar = plt.colorbar(im_diff, ax=axes[3,2], shrink=0.8); cbar.set_label('Difference')
+        # ----- Row 5: Difference components -----
+        for c in range(Cp):
+            vmin, vmax = diff_ranges.get(c, (-1, 1))
+            im = axes[5, c].imshow(diff_components[c], cmap='RdBu_r', vmin=vmin, vmax=vmax)
+            axes[5, c].set_title(f'Diff {labels_pred[c]}')
+            axes[5, c].axis('off')
+            plt.colorbar(im, ax=axes[5, c], fraction=0.046)
+        # Difference magnitude
+        im_diff_mag = axes[5, Cp].imshow(diff_mag, cmap='RdBu_r', vmin=-diff_mag_vmax, vmax=diff_mag_vmax)
+        axes[5, Cp].set_title('Diff |·|')
+        axes[5, Cp].axis('off')
+        plt.colorbar(im_diff_mag, ax=axes[5, Cp], fraction=0.046)
+        # Hide unused
+        for c in range(Cp + 1, n_cols):
+            axes[5, c].axis('off')
+
         plt.suptitle(title)
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -476,7 +626,7 @@ def plot_spectra(model, loader, output_path, title):
         targets = targets.to(next(model.parameters()).device)
         pred = model(inputs)
         error = abs(pred- targets)
-        oct_equiv_err_abs, oct_equiv_err_rel = octahedral_equivariance_error(inputs, pred, targets, model)
+        oct_equiv_err_abs, oct_equiv_err_rel = octahedral_equivariance_error(inputs, pred, targets, model, batch_size=1)
 
         equiv_err_spectra_abs = []
         equiv_err_spectra_rel = []
@@ -538,6 +688,21 @@ def plot_spectra(model, loader, output_path, title):
         plt.tight_layout()
         plt.savefig(output_path)
         plt.close()
+
+def plot_spectrum(k, spec, output_path, title):
+    # TODO: only uses first batch right now
+
+
+    fig, axes = plt.subplots(1, 1, figsize=(12, 12),sharex=True)
+    axes.loglog(k, spec)
+    axes.set_title('Equivariance Error (Absolute)')
+    axes.set_xlabel('Wavenumber')
+    axes.set_ylabel('Normalized Spectrum')
+    plt.suptitle(title)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
 
 
 def visualize_intermediate_features(model, loader, output_path, title, center_mode: str = "cell"):
@@ -1159,8 +1324,17 @@ def plot_intermediate_equivariance_errors(abs_errors_over_time, rel_errors_over_
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
-
 def compute_isotropic_spectrum(field, Lx, Ly=None, Lz=None, tke_normalize=False, spectral_dealias=True, crop_first_bin = True):
+    # computes mean spectrum for a bunch of fields
+    spectra = []
+    for i in tqdm.tqdm(range(field.shape[0]), desc="Computing spectra"):
+        k, spec = compute_single_isotropic_spectrum(field[i].cpu().numpy(), Lx=0.0256)
+        spectra.append(spec)
+    spectra = np.stack(spectra, axis=0)
+    mean_spectra = np.mean(spectra, axis=0)
+    return k, mean_spectra
+
+def compute_single_isotropic_spectrum(field, Lx, Ly=None, Lz=None, tke_normalize=False, spectral_dealias=True, crop_first_bin = True):
     """
     field: (3, Nx, Ny, Nz) velocity field [m/s]
     Returns:
@@ -1222,10 +1396,6 @@ def compute_isotropic_spectrum(field, Lx, Ly=None, Lz=None, tke_normalize=False,
     else:
         return centers[mask], E_k_masked
 
-    if crop_first_bin:
-        return centers[mask][1:], E_k_masked[1:]    
-    else:
-        return centers[mask], E_k_masked
     
 
 def scale_separate_field(field, Lx, Ly=None, Lz=None, tke_normalize=False, spectral_dealias=True, crop_first_bin = True, num_scales=4, return_intermediates=False):

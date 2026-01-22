@@ -181,12 +181,32 @@ def load_box_timeseries(prefix, box_number=1,numpy_dir='numpy_individual_arrays'
         array[i] = np.load(full_filename(numpy_dir, prefix, box_number, timestep))
     return array
 
-def new_experiment(config_file):
+def new_experiment(config_file, subdirectory):
     config = load_config(config_file)
+    validate_config(config)
+
+    # Auto populate some useful config entries
+    if config.seed == 'random':
+        config.seed = np.random.default_rng().integers(0, 2**32 - 1)
+
+    if 'output_irreps' in config['model'] and config.model.output_irreps.strip() == '0e':
+        config.scalar_predictor = True
+    else:
+        config.scalar_predictor = False
+
     unique_name = petname.Generate(separator="_")
     config['barcode'] = f"{datetime.datetime.now().strftime('%y_%m_%d_%H:%M:%S')}_{unique_name}_{config['task_name']}"
-    os.makedirs(os.path.join(global_config.experiment_outputs, config['barcode']), exist_ok=False)
-    with open(os.path.join(global_config.experiment_outputs, config['barcode'], 'experiment_setup.txt'), 'w') as f:
+
+    if subdirectory is not None:
+        config['directory'] = os.path.join(global_config.experiment_outputs, subdirectory, config['barcode'])
+    else:
+        config['directory'] = os.path.join(global_config.experiment_outputs, config['barcode'])
+
+    os.makedirs(config['directory'], exist_ok=False)
+
+    setup_logging(os.path.join(config['directory'], f'{config.barcode}_training_log.txt'))
+
+    with open(os.path.join(config['directory'], 'experiment_setup.txt'), 'w') as f:
         f.write("Experiment config:\n")
         f.write(yaml.dump(config.to_dict(), default_flow_style=False, indent=2))
         f.write("\nContents of global_config.py:\n")
@@ -194,11 +214,30 @@ def new_experiment(config_file):
         with open('src/global_config.py', 'r') as config_file:
             f.write(config_file.read())
         f.write("\n" + "=" * 50 + "\n")
-
-    setup_logging(os.path.join(global_config.experiment_outputs, f'{config.barcode}',f'{config.barcode}_training_log.txt'))
-
     return config
 
+def validate_config(config):
+    if config.train_aug_group is not None:
+        if config.train_aug_group not in ["oct", "so3"]:
+            raise ValueError(f"Invalid augmentation group: {config.train_aug_group}")
+    if config.val_aug_group is not None:
+        if config.val_aug_group not in ["oct", "so3"]:
+            raise ValueError(f"Invalid augmentation group: {config.val_aug_group}")
+    if config.test_aug_group is not None:
+        if config.test_aug_group not in ["oct", "so3"]:
+            raise ValueError(f"Invalid augmentation group: {config.test_aug_group}")
+    if config.loss_type not in ['L1', 'L2']:
+        raise ValueError(f"Invalid loss type: {config.loss_type}")
+
+    if config.seed == 'random':
+        pass
+    elif isinstance(config.seed, int):
+        pass
+    else:
+        raise ValueError(f"Invalid seed: {config.seed}")
+    
+    if config.early_stopping_patience < config.save_interval:
+        raise ValueError(f"Hmmmmm, early stopping patience should be greater than save interval: {config.early_stopping_patience} < {config.save_interval}")
 
 def setup_logging(log_file, level=logging.INFO, redirect_print=True):
     """
